@@ -1,6 +1,6 @@
 import requests
 import re
-from typing import List, Dict, Tuple, Optional
+from typing import List, Dict, Tuple, Optional, Any, Set, Callable
 
 class DashboardGenerator:
     def __init__(
@@ -8,12 +8,18 @@ class DashboardGenerator:
         metrics_endpoint: str,
         dashboard_name: str = "Microservice Metrics Dashboard",
         quantiles: Optional[List[float]] = None,
-        max_metrics: int = 100
+        max_metrics: int = 100,
+        columns_per_row: int = 2,
+        custom_group_patterns: Optional[List[Tuple[str, Callable, str, str, Callable]]] = None,
+        panel_overrides: Optional[Dict[str, Dict[str, Any]]] = None  # <-- add this line
     ):
         self.metrics_endpoint = metrics_endpoint.rstrip("/")
         self.dashboard_name = dashboard_name
         self.quantiles = quantiles if quantiles else [0.5, 0.9, 0.99]
         self.max_metrics = max_metrics
+        self.columns_per_row = columns_per_row
+
+        self.SERVICE_LABEL_CANDIDATES = ["service", "application", "app", "microservice", "job"]
 
         self.HISTOGRAMS = ["_bucket", "_count", "_sum", "_quantile", "_histogram"]
         self.ERRORS = [
@@ -85,9 +91,27 @@ class DashboardGenerator:
             ("General", []),
         ]
 
+        # --- Custom Group Patterns ---
+        default_group_patterns = [
+            ("http_status", lambda n, l: "http_requests_total" in n and ("status" in l or "code" in l),
+                "HTTP Status Codes", "barchart", self.promql_http_status),
+            ("http_error_rate", lambda n, l: "http_requests_total" in n,
+                "HTTP Error Rate", "gauge", self.promql_http_error_rate),
+            ("latency_quantiles", lambda n, l: n.endswith("_bucket"),
+                "Latency Quantiles", "timeseries", self.promql_latency_quantiles),
+            ("error_metrics", lambda n, l: any(e in n for e in self.ERRORS) and "total" in n,
+                "Error Rate Ratio", "gauge", self.promql_error_rate_ratio),
+            ("success_rate", lambda n, l: "http_requests_total" in n and ("status" in l or "code" in l),
+                "HTTP Success Rate", "gauge", self.promql_http_success_rate),
+        ]
+        self.GROUP_PATTERNS = (custom_group_patterns or []) + default_group_patterns
+
     def fetch_raw_metrics(self) -> List[Tuple[str, Tuple[str, ...], Optional[str]]]:
-        response = requests.get(self.metrics_endpoint)
-        response.raise_for_status()
+        try:
+            response = requests.get(self.metrics_endpoint)
+            response.raise_for_status()
+        except Exception as e:
+            raise RuntimeError(f"Failed to fetch metrics from {self.metrics_endpoint}: {e}")
         lines = response.text.splitlines()
         metrics = {}
         help_map = {}
@@ -110,6 +134,71 @@ class DashboardGenerator:
                     labels = tuple(re.findall(r'(\w+)=', label_block))
                 metrics[(name, labels)] = help_map.get(name)
         return sorted([(name, labels, help_text) for (name, labels), help_text in metrics.items()])
+
+    def extract_service_labels(self, metrics: List[Tuple[str, Tuple[str, ...], Optional[str]]]) -> Dict[str, str]:
+        """
+        Returns a mapping: metric_name -> service_label (from candidates) if found, else None.
+        """
+        metric_service_label = {}
+        for metric, labels, _ in metrics:
+            found = None
+            for label in labels:
+                if label in self.SERVICE_LABEL_CANDIDATES:
+                    found = label
+                    break
+            if found:
+                metric_service_label[metric] = found
+        return metric_service_label
+
+    def get_first_service_label_and_metric(self, metric_service_label: Dict[str, str]) -> Tuple[str, str]:
+        """
+        Returns (service_label, metric) for the first metric that has a service label.
+        """
+        if metric_service_label:
+            metric, label = next(iter(metric_service_label.items()))
+            return label, metric
+        return "service", "up"
+
+    # --- PromQL Group Panel Functions ---
+    def promql_http_status(self, metric, labels, service_label):
+        selector = f'{{{service_label}=~"${{service}}"}}' if service_label else ""
+        by_clause = f"by ({service_label}, status)" if service_label else "by (status)"
+        return f"sum(rate({metric}{selector}[1m])) {by_clause}"
+
+    def promql_http_error_rate(self, metric, labels, service_label):
+        selector = f',{service_label}=~"${{service}}"' if service_label else ""
+        by_clause = f"by ({service_label})" if service_label else ""
+        return (
+            f"sum(rate(http_requests_total{{status=~\"5..\"{selector}}}[1m])) {by_clause} "
+            f"/ sum(rate(http_requests_total{{{service_label}=~\"${{service}}\"}}[1m])) {by_clause}" if service_label else
+            "sum(rate(http_requests_total{status=~\"5..\"}[1m])) / sum(rate(http_requests_total[1m]))"
+        )
+
+
+    def promql_http_success_rate(self, metric, labels, service_label):
+        selector = f',{service_label}=~\"${{service}}"' if service_label else ""
+        by_clause = f"by ({service_label})" if service_label else ""
+        return (
+            f"sum(rate(http_requests_total{{status=~\"2..\"{selector}}}[1m])) {by_clause} "
+            f"/ sum(rate(http_requests_total{{{service_label}=~\"${{service}}\"}}[1m])) {by_clause}" if service_label else
+            "sum(rate(http_requests_total{status=~\"2..\"}[1m])) / sum(rate(http_requests_total[1m]))"
+        )
+
+    def promql_latency_quantiles(self, metric, labels, service_label):
+        quantile_vars = "$quantile" if len(self.quantiles) > 1 else str(self.quantiles[0])
+        selector = f'{{{service_label}=~"${{service}}"}}' if service_label else ""
+        by_clause = f"by ({service_label}, le)" if service_label else "by (le)"
+        return f"histogram_quantile({quantile_vars}, sum(rate({metric}{selector}[5m])) {by_clause})"
+
+    def promql_error_rate_ratio(self, metric, labels, service_label):
+        selector = f'{{{service_label}=~"${{service}}"}}' if service_label else ""
+        by_clause = f"by ({service_label})" if service_label else ""
+        return (
+            f"sum(rate({metric}{selector}[1m])) {by_clause} / sum(rate(http_requests_total{selector}[1m])) {by_clause}"
+            if service_label else
+            f"sum(rate({metric}[1m])) / sum(rate(http_requests_total[1m]))"
+        )
+
 
     def classify_row(self, name: str) -> str:
         name_lower = name.lower()
@@ -180,90 +269,191 @@ class DashboardGenerator:
                 metric = metric[len(prefix):]
         return metric.replace("_", " ").title()
 
-    def create_legend(self, labels: Tuple[str, ...]) -> str:
-        if labels:
-            return " ".join([f"{{{{{label}}}}}" for label in labels])
+    def create_legend(self, labels: Tuple[str, ...], service_label: Optional[str]) -> str:
+        # Prefer service label for legend if present, else show all labels
+        if service_label and service_label in labels:
+            return f'{service_label}={{{{{service_label}}}}}'
+        elif labels:
+            for candidate in ["application", "microservice", "service", "app", "job"]:
+                if candidate in labels:
+                    return f'{candidate}={{{{{candidate}}}}}'
+            return ", ".join([f"{label}={{{{{label}}}}}" for label in labels])
         return ""
 
-    def promql_for_metric(self, metric: str, labels: Tuple[str, ...]) -> str:
+    def promql_for_metric(self, metric: str, labels: Tuple[str, ...], service_label: Optional[str]) -> str:
         name_lower = metric.lower()
+        label_selector = f'{{{service_label}=~"${{service}}"}}' if service_label else ""
+        # Panel override
         if metric.endswith("_bucket"):
             quantile_vars = "$quantile" if len(self.quantiles) > 1 else str(self.quantiles[0])
-            return f'histogram_quantile({quantile_vars}, sum(rate({metric}[5m])) by (le))'
-        if any(p in name_lower for p in self.HTTP):
-            if any(s in name_lower for s in ["_duration", "_latency", "_time"]):
-                return f"avg_over_time({metric}[5m])"
-            if "status" in name_lower or "code" in name_lower:
+            if service_label:
+                return f'histogram_quantile({quantile_vars}, sum(rate({metric}{label_selector}[5m])) by (le))'
+            else:
+                return f'histogram_quantile({quantile_vars}, sum(rate({metric}[5m])) by (le))'
+        if "http_requests_total" in name_lower and ("status" in labels or "code" in labels):
+            if service_label:
+                return f"sum(rate({metric}{label_selector}[1m])) by (status)"
+            else:
+                return f"sum(rate({metric}[1m])) by (status)"
+        if "http_requests_total" in name_lower:
+            if service_label:
+                return f"sum(rate({metric}{label_selector}[1m]))"
+            else:
                 return f"sum(rate({metric}[1m]))"
-            if "request" in name_lower or "response" in name_lower:
-                return f"sum(rate({metric}[1m]))"
-            return f"sum(rate({metric}[1m]))"
-        if any(p in name_lower for p in self.BROKER):
-            if "consumer" in name_lower or "producer" in name_lower:
-                return f"sum(rate({metric}[1m]))"
-            if "lag" in name_lower or "offset" in name_lower:
-                return f"max({metric})"
-            if "queue" in name_lower or "exchange" in name_lower or "topic" in name_lower:
-                return f"sum({metric})"
-        if any(p in name_lower for p in self.DOTNET):
-            if "exceptions" in name_lower:
-                return f"sum(rate({metric}[5m]))"
-            if "gc" in name_lower or "allocations" in name_lower:
-                return f"sum({metric})"
-            if "threadpool" in name_lower:
-                return f"max({metric})"
-        if any(p in name_lower for p in self.JAVA):
-            if "gc" in name_lower or "collections" in name_lower:
-                return f"sum({metric})"
-            if "memory" in name_lower or "heap" in name_lower:
-                return f"max({metric})"
-            if "threads" in name_lower:
-                return f"max({metric})"
-        if any(p in name_lower for p in self.REDIS):
-            if "hit" in name_lower or "miss" in name_lower:
-                return f"sum(rate({metric}[5m]))"
-            if "connected_clients" in name_lower:
-                return f"max({metric})"
-        if any(p in name_lower for p in self.DB):
-            if "query" in name_lower or "sql" in name_lower:
-                return f"sum(rate({metric}[1m]))"
-            if "connection" in name_lower or "pool" in name_lower:
-                return f"max({metric})"
-            if "commit" in name_lower or "rollback" in name_lower:
-                return f"sum(rate({metric}[5m]))"
+        if any(k in name_lower for k in self.ERRORS) and "total" in name_lower:
+            if service_label:
+                return (
+                    f"sum(rate({metric}{label_selector}[1m])) "
+                    f"/ sum(rate(http_requests_total{label_selector}[1m]))"
+                )
+            else:
+                return f"sum(rate({metric}[1m])) / sum(rate(http_requests_total[1m]))"
         if any(k in name_lower for k in self.LATENCY):
-            if metric.endswith("_seconds"):
-                return f"avg_over_time({metric}[5m])"
-            return f"avg({metric})"
-        if any(k in name_lower for k in self.ERRORS):
-            return f"sum(rate({metric}[5m]))"
+            if metric.endswith("_seconds") or metric.endswith("_duration_seconds"):
+                if service_label:
+                    return f"avg_over_time({metric}{label_selector}[5m])"
+                else:
+                    return f"avg_over_time({metric}[5m])"
+            if service_label:
+                return f"avg({metric}{label_selector})"
+            else:
+                return f"avg({metric})"
         if any(k in name_lower for k in self.THROUGHPUT):
-            return f"sum(rate({metric}[1m]))"
+            if service_label:
+                return f"sum(rate({metric}{label_selector}[1m]))"
+            else:
+                return f"sum(rate({metric}[1m]))"
         if any(k in name_lower for k in self.RATIOS):
-            return f"avg({metric})"
+            if service_label:
+                return f"avg({metric}{label_selector})"
+            else:
+                return f"avg({metric})"
         if any(k in name_lower for k in self.RESOURCES):
             if "cpu" in name_lower or "memory" in name_lower or "heap" in name_lower:
-                return f"max({metric})"
-            return f"avg({metric})"
-        if any(k in name_lower for k in self.INFRA):
-            return f"sum({metric})"
+                if service_label:
+                    return f"max({metric}{label_selector})"
+                else:
+                    return f"max({metric})"
+            if service_label:
+                return f"avg({metric}{label_selector})"
+            else:
+                return f"avg({metric})"
+        if any(p in name_lower for p in self.DB):
+            if "query" in name_lower or "sql" in name_lower:
+                if service_label:
+                    return f"sum(rate({metric}{label_selector}[1m]))"
+                else:
+                    return f"sum(rate({metric}[1m]))"
+            if "connection" in name_lower or "pool" in name_lower:
+                if service_label:
+                    return f"max({metric}{label_selector})"
+                else:
+                    return f"max({metric})"
+            if "commit" in name_lower or "rollback" in name_lower:
+                if service_label:
+                    return f"sum(rate({metric}{label_selector}[5m]))"
+                else:
+                    return f"sum(rate({metric}[5m]))"
+        if any(p in name_lower for p in self.BROKER):
+            if "consumer" in name_lower or "producer" in name_lower:
+                if service_label:
+                    return f"sum(rate({metric}{label_selector}[1m]))"
+                else:
+                    return f"sum(rate({metric}[1m]))"
+            if "lag" in name_lower or "offset" in name_lower:
+                if service_label:
+                    return f"max({metric}{label_selector})"
+                else:
+                    return f"max({metric})"
+            if "queue" in name_lower or "exchange" in name_lower or "topic" in name_lower:
+                if service_label:
+                    return f"sum({metric}{label_selector})"
+                else:
+                    return f"sum({metric})"
+        if any(p in name_lower for p in self.DOTNET):
+            if "exceptions" in name_lower:
+                if service_label:
+                    return f"sum(rate({metric}{label_selector}[5m]))"
+                else:
+                    return f"sum(rate({metric}[5m]))"
+            if "gc" in name_lower or "allocations" in name_lower:
+                if service_label:
+                    return f"sum({metric}{label_selector})"
+                else:
+                    return f"sum({metric})"
+            if "threadpool" in name_lower:
+                if service_label:
+                    return f"max({metric}{label_selector})"
+                else:
+                    return f"max({metric})"
+        if any(p in name_lower for p in self.JAVA):
+            if "gc" in name_lower or "collections" in name_lower:
+                if service_label:
+                    return f"sum({metric}{label_selector})"
+                else:
+                    return f"sum({metric})"
+            if "memory" in name_lower or "heap" in name_lower:
+                if service_label:
+                    return f"max({metric}{label_selector})"
+                else:
+                    return f"max({metric})"
+            if "threads" in name_lower:
+                if service_label:
+                    return f"max({metric}{label_selector})"
+                else:
+                    return f"max({metric})"
+        if any(p in name_lower for p in self.REDIS):
+            if "hit" in name_lower or "miss" in name_lower:
+                if service_label:
+                    return f"sum(rate({metric}{label_selector}[5m]))"
+                else:
+                    return f"sum(rate({metric}[5m]))"
+            if "connected_clients" in name_lower:
+                if service_label:
+                    return f"max({metric}{label_selector})"
+                else:
+                    return f"max({metric})"
         if any(k in name_lower for k in self.CACHE):
             if "hit" in name_lower or "miss" in name_lower:
-                return f"sum(rate({metric}[5m]))"
-            return f"max({metric})"
+                if service_label:
+                    return f"sum(rate({metric}{label_selector}[5m]))"
+                else:
+                    return f"sum(rate({metric}[5m]))"
+            if service_label:
+                return f"max({metric}{label_selector})"
+            else:
+                return f"max({metric})"
         if any(k in name_lower for k in self.KUBE):
-            return f"max({metric})"
+            if service_label:
+                return f"max({metric}{label_selector})"
+            else:
+                return f"max({metric})"
         if any(k in name_lower for k in self.HISTOGRAMS):
-            return f"sum(rate({metric}[5m]))"
+            if service_label:
+                return f"sum(rate({metric}{label_selector}[5m]))"
+            else:
+                return f"sum(rate({metric}[5m]))"
+        if any(k in name_lower for k in self.ERRORS):
+            if service_label:
+                return f"sum(rate({metric}{label_selector}[5m]))"
+            else:
+                return f"sum(rate({metric}[5m]))"
+        if any(k in name_lower for k in self.INFRA):
+            if service_label:
+                return f"sum({metric}{label_selector})"
+            else:
+                return f"sum({metric})"
+        if service_label:
+            return f"avg({metric}{label_selector})"
         return f"avg({metric})"
 
-    def create_panel(self, metric: str, labels: Tuple[str, ...], help_text: Optional[str], panel_id: int, x: int, y: int) -> Tuple[Dict, str]:
+    def create_panel(self, metric: str, labels: Tuple[str, ...], help_text: Optional[str], panel_id: int, x: int, y: int, service_label: Optional[str]) -> Tuple[Dict, str]:
         visual_type = self.classify_visual(metric)
         unit = self.classify_unit(metric)
         row = self.classify_row(metric)
         title = self.prettify_title(metric)
-        legend = self.create_legend(labels)
-        expr = self.promql_for_metric(metric, labels)
+        legend = self.create_legend(labels, service_label)
+        expr = self.promql_for_metric(metric, labels, service_label)
         panel = {
             "id": panel_id,
             "type": visual_type,
@@ -294,7 +484,20 @@ class DashboardGenerator:
         return panel, row
 
     def generate_dashboard(self) -> Dict:
-        metrics = self.fetch_raw_metrics()
+        try:
+            metrics = self.fetch_raw_metrics()
+        except Exception as e:
+            return {
+                "title": self.dashboard_name,
+                "description": f"Error: {e}",
+                "panels": [],
+                "templating": {"list": []}
+            }
+
+        metric_service_label = self.extract_service_labels(metrics)
+        # Pick the first found label for the dashboard variable
+        service_label, service_metric = self.get_first_service_label_and_metric(metric_service_label)
+
         dashboard = {
             "title": self.dashboard_name,
             "description": (
@@ -318,6 +521,17 @@ class DashboardGenerator:
                         "query": ",".join(str(q) for q in self.quantiles),
                         "current": {"text": str(self.quantiles[0]), "value": str(self.quantiles[0])},
                         "includeAll": False,
+                        "multi": False
+                    },
+                    {
+                        "name": "service",
+                        "type": "query",
+                        "datasource": "Prometheus",
+                        "label": service_label.capitalize(),
+                        "hide": 0,
+                        "query": f'label_values({service_metric}, {service_label})',
+                        "current": {"text": "All", "value": "$__all"},
+                        "includeAll": True,
                         "multi": False
                     }
                 ]
@@ -344,11 +558,13 @@ class DashboardGenerator:
             })
             y_offset += 1
             for i, (metric, labels, help_text) in enumerate(metric_entries):
-                x = (i % 2) * 12
-                y = y_offset + (i // 2) * 8
-                panel, _ = self.create_panel(metric, labels, help_text, panel_id, x, y)
+                # Use the correct service label for this metric if available
+                slabel = metric_service_label.get(metric, service_label)
+                x = (i % self.columns_per_row) * int(24 / self.columns_per_row)
+                y = y_offset + (i // self.columns_per_row) * 8
+                panel, _ = self.create_panel(metric, labels, help_text, panel_id, x, y, slabel)
                 dashboard["panels"].append(panel)
                 panel_id += 1
-            y_offset = y + 8
+            y_offset = y + 8 if metric_entries else y_offset
 
         return dashboard
