@@ -1,10 +1,11 @@
-import requests
-import re
-import logging
 import json
+import logging
+import re
 import time
-from typing import List, Dict, Tuple, Optional, Any, Callable
+from typing import Any, Callable, Dict, List, Optional, Tuple
 from urllib.parse import urlparse
+
+import requests
 try:
     from prometheus_client.parser import text_string_to_metric_families  # optional
 except ImportError:  # pragma: no cover
