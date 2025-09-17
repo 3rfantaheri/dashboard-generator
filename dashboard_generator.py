@@ -11,13 +11,14 @@ class DashboardGenerator:
         max_metrics: int = 100,
         columns_per_row: int = 2,
         custom_group_patterns: Optional[List[Tuple[str, Callable, str, str, Callable]]] = None,
-        panel_overrides: Optional[Dict[str, Dict[str, Any]]] = None  # <-- add this line
+        panel_overrides: Optional[Dict[str, Dict[str, Any]]] = None
     ):
         self.metrics_endpoint = metrics_endpoint.rstrip("/")
         self.dashboard_name = dashboard_name
         self.quantiles = quantiles if quantiles else [0.5, 0.9, 0.99]
         self.max_metrics = max_metrics
         self.columns_per_row = columns_per_row
+        self.panel_overrides = panel_overrides or {}  # <-- store overrides
 
         self.SERVICE_LABEL_CANDIDATES = ["service", "application", "app", "microservice", "job"]
 
@@ -249,10 +250,32 @@ class DashboardGenerator:
             return "stat"
         return "timeseries"
 
+    def create_legend(self, labels: Tuple[str, ...], service_label: Optional[str]) -> str:
+        """
+        Build a Grafana legendFormat. Use actual label name, e.g. service={{service}}
+        """
+        def wrap(label: str) -> str:
+            return f"{label}={{{{{{label}}}}}}"
+
+        if service_label and service_label in labels:
+            return wrap(service_label)
+        if labels:
+            # Prefer a canonical label if present
+            for candidate in ["application", "microservice", "service", "app", "job"]:
+                if candidate in labels:
+                    return wrap(candidate)
+            return ", ".join(wrap(l) for l in labels)
+        return ""
+
     def classify_unit(self, name: str) -> str:
         name_lower = name.lower()
+        if name_lower.endswith("_seconds") or name_lower.endswith("_duration_seconds"):
+            return "s"
         if any(x in name_lower for x in self.HISTOGRAMS):
-            return "ms"
+            # Default to seconds unless explicit _ms
+            if name_lower.endswith("_ms"):
+                return "ms"
+            return "s"
         if any(k in name_lower for k in self.LATENCY):
             return "s"
         if any(k in name_lower for k in self.THROUGHPUT):
@@ -261,25 +284,6 @@ class DashboardGenerator:
             return "percent"
         return "short"
 
-    def prettify_title(self, metric: str) -> str:
-        for prefix in [
-            "go_", "process_", "kube_", "db_", "http_", "rabbitmq_", "amqp_", "kafka_", "redis_", "jvm_", "java_", "dotnet_", "clr_", "aspnet_"
-        ]:
-            if metric.startswith(prefix):
-                metric = metric[len(prefix):]
-        return metric.replace("_", " ").title()
-
-    def create_legend(self, labels: Tuple[str, ...], service_label: Optional[str]) -> str:
-        # Prefer service label for legend if present, else show all labels
-        if service_label and service_label in labels:
-            return f'{service_label}={{{{{service_label}}}}}'
-        elif labels:
-            for candidate in ["application", "microservice", "service", "app", "job"]:
-                if candidate in labels:
-                    return f'{candidate}={{{{{candidate}}}}}'
-            return ", ".join([f"{label}={{{{{label}}}}}" for label in labels])
-        return ""
-
     def promql_for_metric(self, metric: str, labels: Tuple[str, ...], service_label: Optional[str]) -> str:
         name_lower = metric.lower()
         label_selector = f'{{{service_label}=~"${{service}}"}}' if service_label else ""
@@ -287,12 +291,16 @@ class DashboardGenerator:
         if metric.endswith("_bucket"):
             quantile_vars = "$quantile" if len(self.quantiles) > 1 else str(self.quantiles[0])
             if service_label:
-                return f'histogram_quantile({quantile_vars}, sum(rate({metric}{label_selector}[5m])) by (le))'
-            else:
-                return f'histogram_quantile({quantile_vars}, sum(rate({metric}[5m])) by (le))'
-        if "http_requests_total" in name_lower and ("status" in labels or "code" in labels):
+                return (
+                    f'histogram_quantile('
+                    f'{quantile_vars}, sum(rate({metric}{{{service_label}=~"${{service}}"}}[5m])) '
+                    f'by ({service_label}, le))'
+                )
+            return f'histogram_quantile({quantile_vars}, sum(rate({metric}[5m])) by (le))'
+        # HTTP status split
+        if "http_requests_total" in metric.lower() and ("status" in labels or "code" in labels):
             if service_label:
-                return f"sum(rate({metric}{label_selector}[1m])) by (status)"
+                return f"sum(rate({metric}{{{service_label}=~\"${{service}}\"}}[1m])) by ({service_label}, status)"
             else:
                 return f"sum(rate({metric}[1m])) by (status)"
         if "http_requests_total" in name_lower:
@@ -447,19 +455,30 @@ class DashboardGenerator:
             return f"avg({metric}{label_selector})"
         return f"avg({metric})"
 
-    def create_panel(self, metric: str, labels: Tuple[str, ...], help_text: Optional[str], panel_id: int, x: int, y: int, service_label: Optional[str]) -> Tuple[Dict, str]:
+    def create_panel(
+        self,
+        metric: str,
+        labels: Tuple[str, ...],
+        help_text: Optional[str],
+        panel_id: int,
+        x: int,
+        y: int,
+        service_label: Optional[str],
+        width: int
+    ) -> Tuple[Dict, str]:
         visual_type = self.classify_visual(metric)
         unit = self.classify_unit(metric)
         row = self.classify_row(metric)
         title = self.prettify_title(metric)
         legend = self.create_legend(labels, service_label)
         expr = self.promql_for_metric(metric, labels, service_label)
-        panel = {
+
+        panel: Dict[str, Any] = {
             "id": panel_id,
             "type": visual_type,
             "title": title,
             "description": help_text or "",
-            "gridPos": {"x": x, "y": y, "w": 12, "h": 8},
+            "gridPos": {"x": x, "y": y, "w": width, "h": 8},
             "fieldConfig": {
                 "defaults": {
                     "unit": unit,
@@ -477,10 +496,22 @@ class DashboardGenerator:
                 {
                     "expr": expr,
                     "legendFormat": legend,
-                    "refId": "A"
+                    "refId": "A",
+                    "datasource": "Prometheus"
                 }
             ]
         }
+
+        # Apply overrides: exact metric name > panel type
+        override_src = self.panel_overrides.get(metric) or self.panel_overrides.get(visual_type)
+        if override_src:
+            # Shallow merge (simple); deep merge only for dict children
+            for k, v in override_src.items():
+                if isinstance(v, dict) and isinstance(panel.get(k), dict):
+                    panel[k].update(v)
+                else:
+                    panel[k] = v
+
         return panel, row
 
     def generate_dashboard(self) -> Dict:
@@ -540,6 +571,7 @@ class DashboardGenerator:
 
         row_map: Dict[str, List[Tuple[str, Tuple[str, ...], Optional[str]]]] = {}
         panel_id = 1
+        panel_width = int(24 / max(1, self.columns_per_row))
 
         for metric, labels, help_text in metrics[:self.max_metrics]:
             row_key = self.classify_row(metric)
@@ -558,11 +590,10 @@ class DashboardGenerator:
             })
             y_offset += 1
             for i, (metric, labels, help_text) in enumerate(metric_entries):
-                # Use the correct service label for this metric if available
                 slabel = metric_service_label.get(metric, service_label)
-                x = (i % self.columns_per_row) * int(24 / self.columns_per_row)
+                x = (i % self.columns_per_row) * panel_width
                 y = y_offset + (i // self.columns_per_row) * 8
-                panel, _ = self.create_panel(metric, labels, help_text, panel_id, x, y, slabel)
+                panel, _ = self.create_panel(metric, labels, help_text, panel_id, x, y, slabel, panel_width)
                 dashboard["panels"].append(panel)
                 panel_id += 1
             y_offset = y + 8 if metric_entries else y_offset
